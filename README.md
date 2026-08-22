@@ -1,8 +1,8 @@
 # GitHub-CLI
 
 `ghcli` — a small command line wrapper over the GitHub REST API for listing
-repositories, issues, and pull requests, and for opening issues and pull
-requests.
+repositories, issues, and pull requests, and for opening, closing, and
+merging them.
 
 Written in TypeScript for Node 20+, with **no runtime dependencies**: it uses
 the platform `fetch`, `node:util`'s `parseArgs`, and `node:test`.
@@ -33,8 +33,10 @@ ghcli <command> <subcommand> [flags]
 | `ghcli repo list` | List repositories for a user, an organization, or yourself |
 | `ghcli issue list <repository>` | List issues in a repository |
 | `ghcli issue create <repository>` | Open an issue in a repository |
+| `ghcli issue close <repository> <number>` | Close an issue |
 | `ghcli pr list <repository>` | List pull requests in a repository |
 | `ghcli pr create <repository>` | Open a pull request in a repository |
+| `ghcli pr merge <repository> <number>` | Merge a pull request |
 
 Global flags:
 
@@ -91,6 +93,21 @@ git log --oneline main..paginate |
 `pr create` targets the repository's own default branch unless you pass
 `--base`, so it does the right thing on repositories that do not call it
 `main`. Both commands need a token with write access.
+
+### Closing and merging
+
+```bash
+ghcli issue close acme/widgets 12
+ghcli issue close acme/widgets 12 --reason not_planned --comment "Superseded by #34."
+
+ghcli pr merge acme/widgets 34
+ghcli pr merge acme/widgets 34 --method squash --subject "Add pagination (#34)"
+ghcli pr merge acme/widgets 34 --delete-branch
+```
+
+`<number>` may be written `12` or `#12`. `issue close` prints the issue URL;
+`pr merge` prints the merge commit SHA, so it pipes into `git fetch` or
+`git show`.
 
 Output is a plain aligned table:
 
@@ -150,6 +167,19 @@ GitHub returns `404` for both — so `ghcli` says as much in its error hint.
   for a token before sending the request.
 - **Validation failures name the field.** A bare `Validation Failed` becomes
   `Validation Failed (head: invalid)`.
+- **`issue close` refuses pull requests.** GitHub's issues endpoint accepts a
+  pull request number and would close the pull request, so the number is
+  checked first.
+- **`pr merge` refuses drafts, closed pull requests, and conflicting branches
+  by name**, before attempting the merge — GitHub answers all three with the
+  same `405 Pull Request is not mergeable`.
+- **Closing and merging are idempotent.** An already-closed issue or
+  already-merged pull request is reported on stderr and exits `0` without
+  writing anything.
+- **`--delete-branch` declines the cases where it would be wrong**: a fork's
+  branch lives in another repository, and a default branch must survive. A
+  failed deletion is reported but does not fail the merge that already
+  succeeded.
 
 ## Development
 

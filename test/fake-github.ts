@@ -72,7 +72,14 @@ export async function startFakeGitHub(routes: Record<string, Route>): Promise<Fa
       }
 
       const result = route({ url, headers: req.headers, method, body });
-      res.writeHead(result.status ?? 200, {
+      const status = result.status ?? 200;
+      // 204 means no content; sending one would be a protocol violation.
+      if (status === 204) {
+        res.writeHead(status, result.headers ?? {});
+        res.end();
+        return;
+      }
+      res.writeHead(status, {
         'content-type': 'application/json',
         ...result.headers,
       });

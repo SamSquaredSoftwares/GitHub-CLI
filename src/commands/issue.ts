@@ -1,4 +1,5 @@
 import type { GitHubClient } from '../client.js';
+import { UsageError } from '../errors.js';
 import { printCreated, requireAuth } from './created.js';
 import { formatRelativeTime, printRows, type Column, type IO } from '../output.js';
 import type { RepoRef } from '../repo-ref.js';
@@ -87,4 +88,50 @@ export async function issueCreate(
   });
 
   printCreated(created, options.json, io);
+}
+
+export interface IssueCloseOptions {
+  number: number;
+  reason: string;
+  comment?: string | undefined;
+  json: boolean;
+}
+
+export async function issueClose(
+  client: GitHubClient,
+  repo: RepoRef,
+  options: IssueCloseOptions,
+  io: IO,
+): Promise<void> {
+  requireAuth(client, 'Closing an issue');
+
+  const path = `repos/${repo.owner}/${repo.name}/issues/${options.number}`;
+  const existing = await client.get<Issue>(path);
+
+  // The issues endpoint serves pull requests too, so `issue close 42` would
+  // happily close pull request 42. Refuse rather than surprise the caller.
+  if (existing.pull_request !== undefined) {
+    throw new UsageError(
+      `${repo.owner}/${repo.name}#${options.number} is a pull request, not an issue.`,
+      'Close it with `pr merge`, or on GitHub.',
+    );
+  }
+
+  if (existing.state === 'closed') {
+    io.err(`${repo.owner}/${repo.name}#${options.number} is already closed.`);
+    printCreated(existing, options.json, io);
+    return;
+  }
+
+  // Comment first: a close that fails should not leave an orphaned comment,
+  // whereas a comment followed by a failed close is merely incomplete.
+  if (options.comment !== undefined) {
+    await client.post(`${path}/comments`, { body: options.comment });
+  }
+
+  const closed = await client.patch<Issue>(path, {
+    state: 'closed',
+    state_reason: options.reason,
+  });
+  printCreated(closed, options.json, io);
 }

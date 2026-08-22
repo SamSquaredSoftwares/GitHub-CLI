@@ -186,13 +186,37 @@ export class GitHubClient {
     return (await response.json()) as T;
   }
 
-  /** Creates a resource and returns the created object. */
-  async post<T>(path: string, body: unknown): Promise<T> {
+  private async send<T>(method: string, path: string, body: unknown): Promise<T> {
     const response = await this.request(buildUrl(this.apiUrl, path, {}), {
-      method: 'POST',
+      method,
       body: JSON.stringify(body),
     });
     return (await response.json()) as T;
+  }
+
+  /** Creates a resource and returns the created object. */
+  async post<T>(path: string, body: unknown): Promise<T> {
+    return this.send<T>('POST', path, body);
+  }
+
+  /** Updates a resource and returns the updated object. */
+  async patch<T>(path: string, body: unknown): Promise<T> {
+    return this.send<T>('PATCH', path, body);
+  }
+
+  /** Replaces or performs an action on a resource, e.g. merging a pull request. */
+  async put<T>(path: string, body: unknown): Promise<T> {
+    return this.send<T>('PUT', path, body);
+  }
+
+  /**
+   * Deletes a resource.
+   *
+   * Returns nothing: GitHub answers a delete with `204 No Content`, so there
+   * is no body to parse.
+   */
+  async delete(path: string): Promise<void> {
+    await this.request(buildUrl(this.apiUrl, path, {}), { method: 'DELETE' });
   }
 
   /**
