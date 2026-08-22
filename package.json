@@ -1,0 +1,27 @@
+{
+  "name": "@samsquaredsoftwares/github-cli",
+  "version": "0.1.0",
+  "description": "A small CLI that wraps the GitHub REST API: list repos, issues, and pull requests.",
+  "type": "module",
+  "bin": {
+    "ghcli": "dist/src/index.js"
+  },
+  "files": [
+    "dist/src"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "start": "npm run build && node dist/src/index.js"
+  },
+  "license": "MIT",
+  "private": true,
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}
