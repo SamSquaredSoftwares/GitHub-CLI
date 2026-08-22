@@ -4,8 +4,8 @@ import { CliError, UsageError, EXIT_OK } from './errors.js';
 import { consoleIO, type IO } from './output.js';
 import { parseRepoRef } from './repo-ref.js';
 import { repoList } from './commands/repo.js';
-import { issueList, issueCreate } from './commands/issue.js';
-import { prList, prCreate } from './commands/pr.js';
+import { issueList, issueCreate, issueClose } from './commands/issue.js';
+import { prList, prCreate, prMerge } from './commands/pr.js';
 import { resolveBody, readProcessStdin, type StdinReader } from './body.js';
 
 export const BIN = 'ghcli';
@@ -36,6 +36,12 @@ const OPTIONS = {
   'body-file': { type: 'string' },
   head: { type: 'string' },
   draft: { type: 'boolean', default: false },
+  reason: { type: 'string' },
+  comment: { type: 'string' },
+  method: { type: 'string' },
+  subject: { type: 'string' },
+  message: { type: 'string' },
+  'delete-branch': { type: 'boolean', default: false },
 } as const;
 
 type OptionName = keyof typeof OPTIONS;
@@ -116,6 +122,27 @@ FLAGS
 Prints the URL of the new issue, or the full API payload with --json.
 Requires a token with write access to the repository.`,
     },
+    close: {
+      args: '<repository> <number>',
+      summary: 'Close an issue',
+      options: ['reason', 'comment'],
+      help: `Close an issue.
+
+USAGE
+  ${BIN} issue close <repository> <number> [flags]
+
+ARGUMENTS
+  <repository>      ${REPO_ARG_HINT}
+  <number>          Issue number
+
+FLAGS
+  --reason <reason>   completed | not_planned (default: completed)
+  --comment <text>    Post this comment before closing
+
+Refuses a number that turns out to be a pull request, and reports an
+already-closed issue without writing anything.
+Requires a token with write access to the repository.`,
+    },
   },
   pr: {
     list: {
@@ -158,11 +185,37 @@ FLAGS
 Prints the URL of the new pull request, or the full API payload with --json.
 Requires a token with write access to the repository.`,
     },
+    merge: {
+      args: '<repository> <number>',
+      summary: 'Merge a pull request',
+      options: ['method', 'subject', 'message', 'delete-branch'],
+      help: `Merge a pull request.
+
+USAGE
+  ${BIN} pr merge <repository> <number> [flags]
+
+ARGUMENTS
+  <repository>      ${REPO_ARG_HINT}
+  <number>          Pull request number
+
+FLAGS
+  --method <method>   merge | squash | rebase (default: merge)
+  --subject <text>    Title for the merge commit
+  --message <text>    Body for the merge commit
+  --delete-branch     Delete the head branch afterwards
+
+Prints the merge commit SHA, or the full API payload with --json. Drafts,
+closed pull requests and conflicting branches are refused by name before
+the merge is attempted.
+Requires a token with write access to the repository.`,
+    },
   },
 };
 
 const STATES = ['open', 'closed', 'all'];
 const REPO_SORTS = ['created', 'updated', 'pushed', 'full_name'];
+const CLOSE_REASONS = ['completed', 'not_planned'];
+const MERGE_METHODS = ['merge', 'squash', 'rebase'];
 
 function rootHelp(): string {
   const rows: string[] = [];
@@ -256,6 +309,19 @@ function requireOption(name: string, value: OptionValue): string {
     throw new UsageError(`Missing required flag --${name}.`);
   }
   return text;
+}
+
+function requireNumber(positionals: string[], index: number): number {
+  const raw = positionals[index];
+  if (raw === undefined || raw === '') {
+    throw new UsageError('Missing required argument <number>.', 'Expected an issue or pull request number.');
+  }
+  // `#12` is what people copy out of GitHub, so accept it.
+  const value = Number(raw.replace(/^#/, ''));
+  if (!Number.isInteger(value) || value < 1) {
+    throw new UsageError(`'${raw}' is not a valid issue or pull request number.`);
+  }
+  return value;
 }
 
 function requirePositional(positionals: string[], index: number, what: string): string {
@@ -368,7 +434,7 @@ export async function run(context: RunContext): Promise<number> {
     }
   }
 
-  const expectedPositionals = spec.args === '' ? 2 : 3;
+  const expectedPositionals = 2 + (spec.args === '' ? 0 : spec.args.split(' ').length);
   if (positionals.length > expectedPositionals) {
     throw new UsageError(
       `Unexpected argument '${positionals[expectedPositionals]}'.`,
@@ -421,6 +487,28 @@ export async function run(context: RunContext): Promise<number> {
       base: str(values.base),
       body,
       draft: values.draft === true,
+      json,
+    }, io);
+    return EXIT_OK;
+  }
+
+  if (subcommand === 'close') {
+    await issueClose(client, repo, {
+      number: requireNumber(positionals, 3),
+      reason: parseChoice('reason', str(values.reason), CLOSE_REASONS, 'completed'),
+      comment: str(values.comment),
+      json,
+    }, io);
+    return EXIT_OK;
+  }
+
+  if (subcommand === 'merge') {
+    await prMerge(client, repo, {
+      number: requireNumber(positionals, 3),
+      method: parseChoice('method', str(values.method), MERGE_METHODS, 'merge'),
+      subject: str(values.subject),
+      message: str(values.message),
+      deleteBranch: values['delete-branch'] === true,
       json,
     }, io);
     return EXIT_OK;
