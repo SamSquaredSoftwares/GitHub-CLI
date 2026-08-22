@@ -9,12 +9,20 @@ export interface FakeResponse {
 }
 
 export interface RecordedRequest {
+  method: string;
   pathname: string;
   query: Record<string, string>;
   headers: IncomingMessage['headers'];
+  /** Parsed JSON request body, or undefined when there was none. */
+  body: unknown;
 }
 
-export type Route = (request: { url: URL; headers: IncomingMessage['headers'] }) => FakeResponse;
+export type Route = (request: {
+  url: URL;
+  headers: IncomingMessage['headers'];
+  method: string;
+  body: unknown;
+}) => FakeResponse;
 
 export interface FakeGitHub {
   /** Base URL to hand to the client as `--api-url`. */
@@ -34,25 +42,42 @@ export async function startFakeGitHub(routes: Record<string, Route>): Promise<Fa
 
   const server: Server = createServer((req, res) => {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
-    requests.push({
-      pathname: url.pathname,
-      query: Object.fromEntries(url.searchParams),
-      headers: req.headers,
-    });
+    const method = req.method ?? 'GET';
+    const chunks: Buffer[] = [];
 
-    const route = routes[url.pathname];
-    if (route === undefined) {
-      res.writeHead(404, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ message: 'Not Found' }));
-      return;
-    }
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8');
+      let body: unknown;
+      if (raw !== '') {
+        try {
+          body = JSON.parse(raw);
+        } catch {
+          body = raw;
+        }
+      }
+      requests.push({
+        method,
+        pathname: url.pathname,
+        query: Object.fromEntries(url.searchParams),
+        headers: req.headers,
+        body,
+      });
 
-    const result = route({ url, headers: req.headers });
-    res.writeHead(result.status ?? 200, {
-      'content-type': 'application/json',
-      ...result.headers,
+      const route = routes[`${method} ${url.pathname}`] ?? routes[url.pathname];
+      if (route === undefined) {
+        res.writeHead(404, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ message: 'Not Found' }));
+        return;
+      }
+
+      const result = route({ url, headers: req.headers, method, body });
+      res.writeHead(result.status ?? 200, {
+        'content-type': 'application/json',
+        ...result.headers,
+      });
+      res.end(JSON.stringify(result.body ?? null));
     });
-    res.end(JSON.stringify(result.body ?? null));
   });
 
   server.listen(0, '127.0.0.1');

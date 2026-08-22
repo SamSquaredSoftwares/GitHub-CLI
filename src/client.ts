@@ -30,6 +30,28 @@ export class GitHubApiError extends CliError {
 interface ApiErrorBody {
   message?: unknown;
   documentation_url?: unknown;
+  /** Field-level detail, sent with 422 Unprocessable Entity. */
+  errors?: unknown;
+}
+
+/**
+ * Renders GitHub's field-level validation errors as `field: reason` pairs.
+ *
+ * A bare "Validation Failed" says nothing about which field was wrong, and
+ * that is exactly what a create command needs to report.
+ */
+function describeFieldErrors(errors: unknown): string | undefined {
+  if (!Array.isArray(errors) || errors.length === 0) return undefined;
+  const described = errors.flatMap((entry) => {
+    if (typeof entry === 'string') return [entry];
+    if (entry === null || typeof entry !== 'object') return [];
+    const { field, code, message } = entry as Record<string, unknown>;
+    const reason =
+      typeof message === 'string' ? message : typeof code === 'string' ? code : undefined;
+    if (reason === undefined) return [];
+    return [typeof field === 'string' ? `${field}: ${reason}` : reason];
+  });
+  return described.length === 0 ? undefined : described.join('; ');
 }
 
 /**
@@ -81,20 +103,21 @@ export class GitHubClient {
     return this.token !== undefined && this.token !== '';
   }
 
-  private headers(): Record<string, string> {
+  private headers(hasBody = false): Record<string, string> {
     const headers: Record<string, string> = {
       Accept: 'application/vnd.github+json',
       'X-GitHub-Api-Version': '2022-11-28',
       'User-Agent': USER_AGENT,
     };
     if (this.authenticated) headers['Authorization'] = `Bearer ${this.token}`;
+    if (hasBody) headers['Content-Type'] = 'application/json';
     return headers;
   }
 
-  private async request(url: string): Promise<Response> {
+  private async request(url: string, init: RequestInit = {}): Promise<Response> {
     let response: Response;
     try {
-      response = await this.fetchImpl(url, { headers: this.headers() });
+      response = await this.fetchImpl(url, { ...init, headers: this.headers(init.body != null) });
     } catch (cause) {
       throw new CliError(`Could not reach ${new URL(url).host}: ${(cause as Error).message}`, {
         hint: 'Check your network connection or --api-url.',
@@ -107,15 +130,18 @@ export class GitHubClient {
   private async toApiError(response: Response, url: string): Promise<GitHubApiError> {
     let apiMessage: string | undefined;
     let documentationUrl: string | undefined;
+    let fieldErrors: string | undefined;
     try {
       const body = (await response.json()) as ApiErrorBody;
       if (typeof body.message === 'string') apiMessage = body.message;
       if (typeof body.documentation_url === 'string') documentationUrl = body.documentation_url;
+      fieldErrors = describeFieldErrors(body.errors);
     } catch {
       // Non-JSON error bodies (proxies, gateways) carry nothing worth showing.
     }
 
-    const summary = apiMessage ?? response.statusText ?? 'Unknown error';
+    const apiSummary = apiMessage ?? response.statusText ?? 'Unknown error';
+    const summary = fieldErrors === undefined ? apiSummary : `${apiSummary} (${fieldErrors})`;
     const rateLimited =
       (response.status === 403 || response.status === 429) &&
       response.headers.get('x-ratelimit-remaining') === '0';
@@ -136,6 +162,8 @@ export class GitHubClient {
     let hint: string | undefined;
     if (response.status === 401) {
       hint = 'The token was rejected. Check that it is valid and has not expired.';
+    } else if (response.status === 403) {
+      hint = 'The token is valid but lacks permission. A write needs the `repo` scope, or fine-grained write access to this repository.';
     } else if (response.status === 404) {
       hint = this.authenticated
         ? 'Check the name, and that your token can see this resource.'
@@ -155,6 +183,15 @@ export class GitHubClient {
   /** Fetches a single JSON resource. */
   async get<T>(path: string, params: QueryParams = {}): Promise<T> {
     const response = await this.request(buildUrl(this.apiUrl, path, params));
+    return (await response.json()) as T;
+  }
+
+  /** Creates a resource and returns the created object. */
+  async post<T>(path: string, body: unknown): Promise<T> {
+    const response = await this.request(buildUrl(this.apiUrl, path, {}), {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
     return (await response.json()) as T;
   }
 
