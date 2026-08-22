@@ -1,4 +1,6 @@
 import type { GitHubClient } from '../client.js';
+import { UsageError } from '../errors.js';
+import { printCreated, requireAuth } from './created.js';
 import { formatRelativeTime, printRows, type Column, type IO } from '../output.js';
 import type { RepoRef } from '../repo-ref.js';
 
@@ -57,4 +59,51 @@ export async function prList(
     json: options.json,
     emptyMessage: `No ${options.state === 'all' ? '' : `${options.state} `}pull requests found in ${repo.owner}/${repo.name}.`,
   }, io);
+}
+
+export interface PrCreateOptions {
+  title: string;
+  head: string;
+  base?: string | undefined;
+  body?: string | undefined;
+  draft: boolean;
+  json: boolean;
+}
+
+/** Only the field we need off `GET /repos/{owner}/{repo}`. */
+interface RepoDefaults {
+  default_branch: string;
+}
+
+export async function prCreate(
+  client: GitHubClient,
+  repo: RepoRef,
+  options: PrCreateOptions,
+  io: IO,
+): Promise<void> {
+  requireAuth(client, 'Creating a pull request');
+
+  // Without an explicit --base, target whatever the repository calls its
+  // default branch rather than assuming it is named `main`.
+  let base = options.base;
+  if (base === undefined) {
+    const defaults = await client.get<RepoDefaults>(`repos/${repo.owner}/${repo.name}`);
+    base = defaults.default_branch;
+  }
+
+  if (base === options.head) {
+    throw new UsageError(
+      `--head and --base are both '${base}'; a pull request needs two different branches.`,
+    );
+  }
+
+  const created = await client.post<PullRequest>(`repos/${repo.owner}/${repo.name}/pulls`, {
+    title: options.title,
+    head: options.head,
+    base,
+    draft: options.draft,
+    ...(options.body === undefined ? {} : { body: options.body }),
+  });
+
+  printCreated(created, options.json, io);
 }

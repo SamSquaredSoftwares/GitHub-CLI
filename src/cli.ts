@@ -4,8 +4,9 @@ import { CliError, UsageError, EXIT_OK } from './errors.js';
 import { consoleIO, type IO } from './output.js';
 import { parseRepoRef } from './repo-ref.js';
 import { repoList } from './commands/repo.js';
-import { issueList } from './commands/issue.js';
-import { prList } from './commands/pr.js';
+import { issueList, issueCreate } from './commands/issue.js';
+import { prList, prCreate } from './commands/pr.js';
+import { resolveBody, readProcessStdin, type StdinReader } from './body.js';
 
 export const BIN = 'ghcli';
 
@@ -27,9 +28,14 @@ const OPTIONS = {
   limit: { type: 'string' },
   sort: { type: 'string' },
   state: { type: 'string' },
-  label: { type: 'string' },
-  assignee: { type: 'string' },
+  label: { type: 'string', multiple: true },
+  assignee: { type: 'string', multiple: true },
   base: { type: 'string' },
+  title: { type: 'string' },
+  body: { type: 'string' },
+  'body-file': { type: 'string' },
+  head: { type: 'string' },
+  draft: { type: 'boolean', default: false },
 } as const;
 
 type OptionName = keyof typeof OPTIONS;
@@ -88,6 +94,28 @@ FLAGS
 
 Pull requests are excluded, even though the underlying API returns them.`,
     },
+    create: {
+      args: '<repository>',
+      summary: 'Open an issue in a repository',
+      options: ['title', 'body', 'body-file', 'label', 'assignee'],
+      help: `Open an issue in a repository.
+
+USAGE
+  ${BIN} issue create <repository> --title <title> [flags]
+
+ARGUMENTS
+  <repository>      ${REPO_ARG_HINT}
+
+FLAGS
+  --title <title>   Issue title (required)
+  --body <text>     Issue body
+  --body-file <path>  Read the body from a file, or '-' for stdin
+  --label <name>    Label to apply; repeat or comma-separate for several
+  --assignee <login>  User to assign; repeat or comma-separate for several
+
+Prints the URL of the new issue, or the full API payload with --json.
+Requires a token with write access to the repository.`,
+    },
   },
   pr: {
     list: {
@@ -106,6 +134,29 @@ FLAGS
   --state <state>   open | closed | all (default: open)
   --base <branch>   Only pull requests targeting this branch
   --limit <n>       Maximum pull requests to show (default: 30)`,
+    },
+    create: {
+      args: '<repository>',
+      summary: 'Open a pull request in a repository',
+      options: ['title', 'body', 'body-file', 'head', 'base', 'draft'],
+      help: `Open a pull request in a repository.
+
+USAGE
+  ${BIN} pr create <repository> --title <title> --head <branch> [flags]
+
+ARGUMENTS
+  <repository>      ${REPO_ARG_HINT}
+
+FLAGS
+  --title <title>   Pull request title (required)
+  --head <branch>   Branch containing the changes (required); OWNER:BRANCH for a fork
+  --base <branch>   Branch to merge into (default: the repository's default branch)
+  --body <text>     Pull request body
+  --body-file <path>  Read the body from a file, or '-' for stdin
+  --draft           Open as a draft
+
+Prints the URL of the new pull request, or the full API payload with --json.
+Requires a token with write access to the repository.`,
     },
   },
 };
@@ -171,6 +222,42 @@ function parseChoice(name: string, raw: string | undefined, choices: string[], f
   return value;
 }
 
+type OptionValue = string | boolean | string[] | undefined;
+
+function str(value: OptionValue): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
+/**
+ * Flattens a repeatable option into a list.
+ *
+ * Both idioms work and mix freely: `--label a --label b` and `--label a,b`.
+ */
+function list(value: OptionValue): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .flatMap((entry) => entry.split(','))
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== '');
+}
+
+/** Reads an option that the API accepts only one of. */
+function single(name: string, value: OptionValue): string | undefined {
+  const values = list(value);
+  if (values.length > 1) {
+    throw new UsageError(`--${name} may only be given once here (got ${values.length} values).`);
+  }
+  return values[0];
+}
+
+function requireOption(name: string, value: OptionValue): string {
+  const text = str(value);
+  if (text === undefined || text === '') {
+    throw new UsageError(`Missing required flag --${name}.`);
+  }
+  return text;
+}
+
 function requirePositional(positionals: string[], index: number, what: string): string {
   const value = positionals[index];
   if (value === undefined || value === '') {
@@ -183,6 +270,8 @@ export interface RunContext {
   argv: string[];
   env?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch | undefined;
+  /** Injection seam for `--body-file -`; defaults to the real stdin. */
+  readStdin?: StdinReader | undefined;
   out?: (text: string) => void;
   err?: (text: string) => void;
 }
@@ -201,7 +290,7 @@ export async function run(context: RunContext): Promise<number> {
   };
   const out = io.out;
 
-  let values: Partial<Record<OptionName, string | boolean>>;
+  let values: Partial<Record<OptionName, OptionValue>>;
   let positionals: string[];
   let provided: Set<string>;
   try {
@@ -212,7 +301,7 @@ export async function run(context: RunContext): Promise<number> {
       strict: true,
       tokens: true,
     });
-    values = parsed.values as Partial<Record<OptionName, string | boolean>>;
+    values = parsed.values as Partial<Record<OptionName, OptionValue>>;
     positionals = parsed.positionals;
     provided = new Set(
       parsed.tokens.flatMap((token) => (token.kind === 'option' ? [token.name] : [])),
@@ -288,33 +377,64 @@ export async function run(context: RunContext): Promise<number> {
   }
 
   const client = new GitHubClient({
-    token: resolveToken(values.token, env),
-    apiUrl: (values['api-url'] as string | undefined) ?? env['GITHUB_API_URL'] ?? DEFAULT_API_URL,
+    token: resolveToken(str(values.token), env),
+    apiUrl: str(values['api-url']) ?? env['GITHUB_API_URL'] ?? DEFAULT_API_URL,
     fetchImpl: context.fetchImpl,
   });
 
   const json = values.json === true;
-  const limit = parseLimit(values.limit as string | undefined, 30);
 
   if (group === 'repo') {
     await repoList(client, {
-      user: values.user as string | undefined,
-      org: values.org as string | undefined,
-      sort: parseChoice('sort', values.sort as string | undefined, REPO_SORTS, 'pushed'),
-      limit,
+      user: str(values.user),
+      org: str(values.org),
+      sort: parseChoice('sort', str(values.sort), REPO_SORTS, 'pushed'),
+      limit: parseLimit(str(values.limit), 30),
       json,
     }, io);
     return EXIT_OK;
   }
 
   const repo = parseRepoRef(requirePositional(positionals, 2, 'repository'));
-  const state = parseChoice('state', values.state as string | undefined, STATES, 'open');
+
+  if (subcommand === 'create') {
+    const body = await resolveBody(
+      { body: str(values.body), bodyFile: str(values['body-file']) },
+      context.readStdin ?? readProcessStdin,
+    );
+    const title = requireOption('title', values.title);
+
+    if (group === 'issue') {
+      await issueCreate(client, repo, {
+        title,
+        body,
+        labels: list(values.label),
+        assignees: list(values.assignee),
+        json,
+      }, io);
+      return EXIT_OK;
+    }
+
+    await prCreate(client, repo, {
+      title,
+      head: requireOption('head', values.head),
+      base: str(values.base),
+      body,
+      draft: values.draft === true,
+      json,
+    }, io);
+    return EXIT_OK;
+  }
+
+  const state = parseChoice('state', str(values.state), STATES, 'open');
+  const limit = parseLimit(str(values.limit), 30);
 
   if (group === 'issue') {
     await issueList(client, repo, {
+      // The API filters on a comma-separated label list, ANDing the names.
+      label: list(values.label).join(',') || undefined,
+      assignee: single('assignee', values.assignee),
       state,
-      label: values.label as string | undefined,
-      assignee: values.assignee as string | undefined,
       limit,
       json,
     }, io);
@@ -323,7 +443,7 @@ export async function run(context: RunContext): Promise<number> {
 
   await prList(client, repo, {
     state,
-    base: values.base as string | undefined,
+    base: str(values.base),
     limit,
     json,
   }, io);
@@ -331,9 +451,10 @@ export async function run(context: RunContext): Promise<number> {
 }
 
 /** Precedence: explicit flag, then GITHUB_TOKEN, then GH_TOKEN. */
-function resolveToken(flag: string | boolean | undefined, env: NodeJS.ProcessEnv): string | undefined {
-  const candidates = [typeof flag === 'string' ? flag : undefined, env['GITHUB_TOKEN'], env['GH_TOKEN']];
-  return candidates.find((value) => value !== undefined && value !== '');
+function resolveToken(flag: string | undefined, env: NodeJS.ProcessEnv): string | undefined {
+  return [flag, env['GITHUB_TOKEN'], env['GH_TOKEN']].find(
+    (value) => value !== undefined && value !== '',
+  );
 }
 
 let cachedVersion: string | undefined;
